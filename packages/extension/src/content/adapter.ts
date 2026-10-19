@@ -105,7 +105,12 @@ export async function runJob(ctx: RunContext): Promise<RunResult> {
   // Approve buttons already on the page (earlier chat turns) are never clicked; only new ones.
   const staleApprove = new Set(strategiesFor('approve', pack, taught).flatMap((s) => matchStrategy(s)));
   recorder.start();
-  await clickEl(submit.el);
+  const how = await submitAndConfirm(submit.el, composer.el, text, ctx);
+  if (!how) {
+    recorder.stop();
+    throw new JobFailure('UI_CHANGED', 'Clicked Generate but Flow did not start. Re-teach the "Generate / send button" (click the arrow button itself) and try again.', false);
+  }
+  if (how !== 'click') notes.push(`submitted via ${how}`);
   submitted = true;
   ctx.progress('generating', 'submitted');
 
@@ -328,4 +333,39 @@ async function attachRefs(ctx: RunContext): Promise<void> {
   const ok = await waitFor(() => document.querySelectorAll('img').length >= before + Math.min(1, files.length), 15_000, ctx.cancelled);
   if (!ok) throw new JobFailure('UI_ELEMENT_MISSING', 'Reference images did not appear in Flow after attaching.', false);
   await sleepReal(1200);
+}
+
+/**
+ * Flow sometimes ignores the first synthetic click (editor state not synced yet, or the taught
+ * element is an inner icon / wrapper rather than the button). Confirm the submit really happened
+ * and fall back to the parent button, then Enter in the prompt box. Returns how it went through,
+ * or null when nothing worked.
+ */
+async function submitAndConfirm(btn: HTMLElement, composer: HTMLElement, text: string, ctx: RunContext): Promise<'click' | 'button' | 'enter' | null> {
+  const { pack, taught } = ctx;
+  const want = normalize(text).length;
+  const started = () => {
+    if (isBusy(pack, taught)) return true;
+    const box = find('composer', pack, taught)?.el ?? composer;
+    // Flow clears the prompt box once it accepts the prompt.
+    return normalize(readText(box)).length < Math.min(10, want);
+  };
+  const tryIt = async (fire: () => Promise<void>) => {
+    await fire();
+    return !!(await waitFor(() => started() || null, 3500, ctx.cancelled));
+  };
+
+  if (await tryIt(() => clickEl(btn))) return 'click';
+  const outer = btn.closest('button, [role="button"]') as HTMLElement | null;
+  const target = outer && outer !== btn ? outer : (find('submit', pack, taught)?.el ?? btn);
+  if (isEnabled(target) && (await tryIt(() => clickEl(target)))) return 'button';
+  const enter = async () => {
+    composer.focus();
+    const o = { key: 'Enter', code: 'Enter', keyCode: 13, which: 13, bubbles: true, cancelable: true, composed: true };
+    composer.dispatchEvent(new KeyboardEvent('keydown', o));
+    composer.dispatchEvent(new KeyboardEvent('keypress', o));
+    composer.dispatchEvent(new KeyboardEvent('keyup', o));
+  };
+  if (await tryIt(enter)) return 'enter';
+  return null;
 }
