@@ -144,6 +144,28 @@ export async function clickEl(el: HTMLElement): Promise<void> {
 }
 
 /** Replace the content of a textarea/input/contenteditable in a way frameworks notice. */
+/**
+ * Real (isTrusted) click through the background's debugger session. Flow ignores synthetic
+ * clicks on some controls (Generate, plan approval). Falls back to clickEl when unavailable.
+ */
+export async function trustedClick(el: HTMLElement): Promise<{ ok: boolean; error?: string }> {
+  el.scrollIntoView({ block: 'center', inline: 'center', behavior: 'instant' as ScrollBehavior });
+  await new Promise((r) => setTimeout(r, 50));
+  const r = el.getBoundingClientRect();
+  try {
+    const res = (await chrome.runtime.sendMessage({ ffTrusted: 'click', x: r.left + r.width / 2, y: r.top + r.height / 2 })) as { ok: boolean; error?: string } | undefined;
+    if (res?.ok) {
+      await new Promise((r2) => setTimeout(r2, 60));
+      return res;
+    }
+    await clickEl(el);
+    return { ok: false, error: res?.error ?? 'no response from background' };
+  } catch (e) {
+    await clickEl(el);
+    return { ok: false, error: (e as Error).message };
+  }
+}
+
 export async function setText(el: HTMLElement, text: string): Promise<void> {
   el.focus();
   if (el instanceof HTMLTextAreaElement || el instanceof HTMLInputElement) {

@@ -8,7 +8,7 @@
   "action": { "default_title": "Open FlowForge" },
   "side_panel": { "default_path": "sidepanel.html" },
   "background": { "service_worker": "background.js", "type": "module" },
-  "permissions": ["sidePanel", "storage", "unlimitedStorage", "downloads", "tabs", "scripting", "alarms", "notifications"],
+  "permissions": ["sidePanel", "storage", "unlimitedStorage", "downloads", "tabs", "scripting", "alarms", "notifications", "debugger"],
   "host_permissions": [
     "https://flow.google.com/*",
     "https://labs.google/*",

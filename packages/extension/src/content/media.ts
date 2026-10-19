@@ -40,7 +40,8 @@ export function listMedia(pack: SelectorPack): MediaCandidate[] {
   document.querySelectorAll('img').forEach((img) => {
     const src = img.currentSrc || img.src;
     if (!src || seen.has(src) || excluded(img, pack)) return;
-    if (!img.complete || Math.min(img.naturalWidth, img.naturalHeight) < pack.media.minImageSide) return;
+    // Hidden tabs never decode images, so `complete` stays false; known dimensions are enough.
+    if (Math.min(img.naturalWidth, img.naturalHeight) < pack.media.minImageSide) return;
     // Known output hosts are preferred, but any large https image that is not an icon counts,
     // so a CDN change in Flow does not make every job look like it produced nothing.
     if (pack.media.denyHosts.some((h) => src.includes(h))) return;
@@ -62,7 +63,10 @@ export function snapshotKeys(pack: SelectorPack): Set<string> {
 
 /** A video tile is usable once it has metadata; before that Flow is still rendering it. */
 export function candidateReady(c: MediaCandidate): boolean {
-  if (c.kind === 'image') return (c.el as HTMLImageElement).complete;
+  if (c.kind === 'image') {
+    const img = c.el as HTMLImageElement;
+    return img.complete || img.naturalWidth > 0;
+  }
   const v = c.el as HTMLVideoElement;
   return v.readyState >= 1 && Number.isFinite(v.duration) && v.duration > 0;
 }

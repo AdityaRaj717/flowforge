@@ -3,7 +3,7 @@ import { MODE_OUTPUT } from '@flowforge/core';
 import type { SelectorPack, Strategy, TargetId } from '../shared/pack';
 import type { CollectedOutput, RefPayload, RunSettings } from '../shared/messages';
 import { b64ToBlob } from '../shared/db';
-import { clickEl, find, isEnabled, isVisible, matchStrategy, nap, NewTextRecorder, normalize, readText, setText, sleepReal, strategiesFor, waitFor } from './dom';
+import { clickEl, find, trustedClick, isEnabled, isVisible, matchStrategy, nap, NewTextRecorder, normalize, readText, setText, sleepReal, strategiesFor, waitFor } from './dom';
 import { checkSignals, detectPageState, isBusy } from './detect';
 import { candidateReady, collect, listMedia, snapshotKeys } from './media';
 import { applyAgentSettings, composerArea, dismissBenignDialogs, uploadViaPicker } from './flowui';
@@ -110,7 +110,7 @@ export async function runJob(ctx: RunContext): Promise<RunResult> {
     recorder.stop();
     throw new JobFailure('UI_CHANGED', 'Clicked Generate but Flow did not start. Re-teach the "Generate / send button" (click the arrow button itself) and try again.', false);
   }
-  if (how !== 'click') notes.push(`submitted via ${how}`);
+  if (how !== 'trusted') notes.push(`submitted via ${how}`);
   submitted = true;
   ctx.progress('generating', 'submitted');
 
@@ -138,12 +138,13 @@ async function waitForOutputs(ctx: RunContext, before: Set<string>, rec: NewText
   let stableSince = 0;
   let lastCount = -1;
   let sawBusy = false;
+  let idleSince = 0; // when Flow last stopped looking busy
   const startedAt = Date.now();
 
   while (Date.now() < deadline) {
     if (ctx.cancelled()) {
       const stop = find('stop', pack, taught);
-      if (stop) await clickEl(stop.el);
+      if (stop) await trustedClick(stop.el);
       throw new JobFailure('CANCELLED', 'Cancelled while generating.', submitted());
     }
     await nap(1000);
@@ -158,7 +159,7 @@ async function waitForOutputs(ctx: RunContext, before: Set<string>, rec: NewText
       const usable = ap && !inComposer && !staleApprove.has(ap.el) && ap.el !== submitEl && ap.el !== submitNow && !ap.el.contains(submitEl);
       if (ap && usable && isEnabled(ap.el) && Date.now() - startedAt > 1500) {
         staleApprove.add(ap.el);
-        await clickEl(ap.el);
+        await trustedClick(ap.el);
         approvals++;
         ctx.progress('generating', 'approved the agent plan');
         stableSince = 0;
@@ -167,7 +168,10 @@ async function waitForOutputs(ctx: RunContext, before: Set<string>, rec: NewText
     }
 
     const busy = isBusy(pack, taught);
-    if (busy) sawBusy = true;
+    if (busy) {
+      sawBusy = true;
+      idleSince = 0;
+    } else if (!idleSince) idleSince = Date.now();
     const fresh = listMedia(pack).filter((m) => !before.has(m.key));
     const ready = fresh.filter(candidateReady);
     const wanted = ready.filter((m) => m.kind === want);
@@ -177,12 +181,16 @@ async function waitForOutputs(ctx: RunContext, before: Set<string>, rec: NewText
       stableSince = Date.now();
       if (count) ctx.progress('generating', `${count} output(s) so far`);
     }
-    const settled = Date.now() - stableSince >= settings.settleSec * 1000;
+    // Short of the expected count, give late tiles longer (they lag in background tabs).
+    const settleMs = count < expected ? Math.max(15_000, settings.settleSec * 3000) : settings.settleSec * 1000;
+    const settled = Date.now() - stableSince >= settleMs;
     if (!busy && count > 0 && (count >= expected || settled)) {
       return wanted.length ? wanted : ready;
     }
     // Not busy, nothing new, and long enough that the agent clearly answered with text instead.
-    if (!busy && sawBusy && count === 0 && Date.now() - stableSince > Math.max(25_000, settings.settleSec * 4000)) {
+    // Measured from when Flow went idle: tiles render a moment after the Stop button disappears,
+    // so timing from the last count change would fail every generation longer than the window.
+    if (!busy && sawBusy && count === 0 && Date.now() - idleSince > Math.max(25_000, settings.settleSec * 4000)) {
       const tail = rec.text().split('\n').filter((l) => !normalize(typed).includes(normalize(l))).slice(-3).join(' ').slice(0, 300);
       throw new JobFailure('NO_OUTPUT', 'Flow finished without producing media.', true, tail || undefined);
     }
@@ -336,12 +344,12 @@ async function attachRefs(ctx: RunContext): Promise<void> {
 }
 
 /**
- * Flow sometimes ignores the first synthetic click (editor state not synced yet, or the taught
- * element is an inner icon / wrapper rather than the button). Confirm the submit really happened
- * and fall back to the parent button, then Enter in the prompt box. Returns how it went through,
- * or null when nothing worked.
+ * Flow ignores script-made clicks and key presses on Generate (it checks isTrusted), so the
+ * submit goes through the background's trusted click. Confirms Flow actually started; falls back
+ * to a plain DOM click (mock pages, or the debugger could not attach). Returns how it went
+ * through, or null when nothing worked.
  */
-async function submitAndConfirm(btn: HTMLElement, composer: HTMLElement, text: string, ctx: RunContext): Promise<'click' | 'button' | 'enter' | null> {
+async function submitAndConfirm(btn: HTMLElement, composer: HTMLElement, text: string, ctx: RunContext): Promise<'trusted' | 'click' | null> {
   const { pack, taught } = ctx;
   const want = normalize(text).length;
   const started = () => {
@@ -350,22 +358,20 @@ async function submitAndConfirm(btn: HTMLElement, composer: HTMLElement, text: s
     // Flow clears the prompt box once it accepts the prompt.
     return normalize(readText(box)).length < Math.min(10, want);
   };
-  const tryIt = async (fire: () => Promise<void>) => {
+  const tryIt = async (fire: () => Promise<unknown>) => {
     await fire();
-    return !!(await waitFor(() => started() || null, 3500, ctx.cancelled));
+    return !!(await waitFor(() => started() || null, 4000, ctx.cancelled));
   };
-
-  if (await tryIt(() => clickEl(btn))) return 'click';
-  const outer = btn.closest('button, [role="button"]') as HTMLElement | null;
-  const target = outer && outer !== btn ? outer : (find('submit', pack, taught)?.el ?? btn);
-  if (isEnabled(target) && (await tryIt(() => clickEl(target)))) return 'button';
-  const enter = async () => {
-    composer.focus();
-    const o = { key: 'Enter', code: 'Enter', keyCode: 13, which: 13, bubbles: true, cancelable: true, composed: true };
-    composer.dispatchEvent(new KeyboardEvent('keydown', o));
-    composer.dispatchEvent(new KeyboardEvent('keypress', o));
-    composer.dispatchEvent(new KeyboardEvent('keyup', o));
-  };
-  if (await tryIt(enter)) return 'enter';
+  const target = (btn.closest('button, [role="button"]') as HTMLElement | null) ?? btn;
+  let trustedErr = '';
+  if (
+    await tryIt(async () => {
+      const r = await trustedClick(target);
+      if (!r.ok) trustedErr = r.error ?? 'failed';
+    })
+  )
+    return trustedErr ? 'click' : 'trusted';
+  if (await tryIt(() => clickEl(target))) return 'click';
+  if (trustedErr) throw new JobFailure('UI_CHANGED', `Could not press Generate: ${trustedErr}`, false);
   return null;
 }

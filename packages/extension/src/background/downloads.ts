@@ -36,6 +36,21 @@ export async function download(url: string, filename: string, timeoutMs = 10 * 6
         reject(new Error(it.error ?? 'download interrupted'));
       }
     });
+    // Download managers (IDM Integration Module and similar) grab the download and leave it
+    // paused at 0 bytes. Resume once; if it is still stuck, say why instead of hanging.
+    const stall = async (resumed: boolean) => {
+      if (!waiters.has(id)) return;
+      const [it] = await chrome.downloads.search({ id });
+      if (!it?.paused || it.bytesReceived > 0) return;
+      if (!resumed) {
+        await chrome.downloads.resume(id).catch(() => undefined);
+        setTimeout(() => void stall(true), 8000);
+        return;
+      }
+      waiters.delete(id);
+      reject(new Error('stuck paused; another extension (for example IDM Integration Module) is intercepting downloads'));
+    };
+    setTimeout(() => void stall(false), 8000);
     setTimeout(() => {
       if (waiters.has(id)) {
         waiters.delete(id);

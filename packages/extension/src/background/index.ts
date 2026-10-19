@@ -11,6 +11,9 @@ import { bridgeStatus, connectBridge, startBridgeEvents } from './bridge';
 import { runStoryboard, runWorkflow } from './runners';
 import { deleteJobs, deleteQueue, jobsOf, load, log, saveJob, saveJobs, saveQueue, state } from './store';
 import { attachWorker, injectExisting, isFlowUrl, onWorkerMessage, openFlowTab, sendTo, workers } from './workers';
+import { startTrustedInput } from './trusted';
+
+startTrustedInput();
 
 const ready = (async () => {
   await load();
