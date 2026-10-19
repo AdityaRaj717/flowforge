@@ -1,0 +1,11 @@
+name = "flowforge-license"
+main = "src/index.ts"
+compatibility_date = "2026-09-01"
+
+# Create with: npx wrangler@3.114.0 kv namespace create LICENSES  (then paste the id here)
+[[kv_namespaces]]
+binding = "LICENSES"
+id = "REPLACE_WITH_KV_NAMESPACE_ID"
+
+# Secrets (never in this file): LS_WEBHOOK_SECRET, LICENSE_PRIVATE_KEY, VARIANT_PLANS,
+# RESEND_API_KEY, MAIL_FROM, ADMIN_TOKEN. See docs/LAUNCH.md.

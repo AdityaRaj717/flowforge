@@ -1,0 +1,201 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<title>Mock Flow agent UI (FlowForge test page)</title>
+<style>
+  /* Mirrors the structure of flow.google.com's project view (Oct 2026) for adapter tests. */
+  body { margin: 0; font: 14px system-ui, sans-serif; background: #000; color: #e8e8ea; height: 100vh; display: grid; grid-template-columns: 1fr 380px; }
+  #media { padding: 16px; display: grid; grid-template-columns: repeat(auto-fill, minmax(160px, 1fr)); gap: 8px; align-content: start; }
+  #media img, #media video { width: 100%; border-radius: 6px; }
+  aside { border-left: 1px solid #222; display: grid; grid-template-rows: auto 1fr auto; min-height: 0; position: relative; }
+  aside header { display: flex; gap: 8px; padding: 10px; align-items: center; }
+  #log { overflow: auto; padding: 10px; display: flex; flex-direction: column; gap: 8px; }
+  .msg { padding: 8px 10px; border-radius: 10px; background: #1b1c20; white-space: pre-wrap; }
+  .msg.user { background: #263046; align-self: flex-end; }
+  .msg img, .msg video { width: 260px; display: block; margin-top: 6px; }
+  .composer { margin: 10px; border: 1px solid #333; border-radius: 14px; padding: 8px; }
+  .composer [contenteditable] { min-height: 40px; outline: none; white-space: pre-wrap; }
+  .chips { display: flex; gap: 6px; }
+  .chips img { width: 40px; height: 40px; object-fit: cover; border-radius: 6px; }
+  .row { display: flex; gap: 6px; align-items: center; }
+  button { background: #222; color: #eee; border: 1px solid #333; border-radius: 8px; padding: 6px 10px; cursor: pointer; }
+  .cdk-overlay-pane { position: fixed; z-index: 10; background: #18191d; border: 1px solid #333; border-radius: 12px; padding: 12px; }
+  #settings { position: absolute; inset: 0; background: #111; padding: 12px; display: none; overflow: auto; }
+  [role="radio"][aria-checked="true"] { background: #444; }
+</style>
+</head>
+<body>
+<section id="media"></section>
+<aside>
+  <header>
+    <button aria-label="Open session history">menu</button>
+    <b style="flex:1">Untitled session</b>
+    <button aria-label="Start new session" id="newSession">edit_square</button>
+  </header>
+  <div id="log"></div>
+  <div class="composer" id="composerBox">
+    <div class="chips" id="chips"></div>
+    <div role="textbox" contenteditable="true" aria-label="What do you want to create?" id="composer"></div>
+    <div class="row">
+      <button aria-label="Add ingredients to the prompt box" aria-haspopup="true" type="button" id="add">add</button>
+      <span style="flex:1"></span>
+      <button aria-label="Agent instructions">article_spark</button>
+      <button aria-label="Settings" id="tune">tune</button>
+      <button aria-label="Start generation" id="go">arrow_forward</button>
+    </div>
+  </div>
+  <div id="settings">
+    <div class="row"><button aria-label="Back" id="back">arrow_back</button><h2 style="flex:1;margin:0;font-size:15px">Agent settings</h2></div>
+    <div role="radiogroup">Confirm before generating <label><input type="radio" name="c" id="always" />Always</label> <label><input type="radio" name="c" checked />Never</label></div>
+    <p>Image generation default</p>
+    <flow-toggles aria-label="Image generation default aspect ratio"><div role="radiogroup" data-key="image.aspect"></div></flow-toggles>
+    <flow-toggles aria-label="Image generation default output count"><div role="radiogroup" data-key="image.count"></div></flow-toggles>
+    <button aria-label="Image generation default model" data-model="image">🍌 Nano Banana 2.1 arrow_drop_down</button>
+    <p>Video generation default</p>
+    <flow-toggles aria-label="Video generation default aspect ratio"><div role="radiogroup" data-key="video.aspect"></div></flow-toggles>
+    <flow-toggles aria-label="Video generation default output count"><div role="radiogroup" data-key="video.count"></div></flow-toggles>
+    <button aria-label="Video generation default model" data-model="video">Veo 3.1 - Lite arrow_drop_down</button>
+    <p><button id="save">Save</button></p>
+  </div>
+</aside>
+<script>
+const $ = (id) => document.getElementById(id);
+const params = new URLSearchParams(location.search);
+const saved = { image: { aspect: '16:9', count: 2, model: 'Nano Banana 2.1' }, video: { aspect: '16:9', count: 1, model: 'Veo 3.1 - Lite' } };
+let draft = JSON.parse(JSON.stringify(saved));
+let consented = params.get('consent') === '1';
+let attached = [];
+const OPTIONS = { 'image.aspect': ['16:9', '4:3', '1:1', '3:4', '9:16'], 'video.aspect': ['16:9', '9:16'], 'image.count': [1, 2, 3, 4], 'video.count': [1, 2, 3, 4] };
+const MODELS = { image: ['🍌 Nano Banana Pro', '🍌 Nano Banana 2 Lite', '🍌 Nano Banana 2.1'], video: ['Omni 1.1 Flash', 'Veo 3.1 - Lite', 'Veo 3.1 - Fast', 'Veo 3.1 - Quality'] };
+const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+
+function renderSettings() {
+  document.querySelectorAll('[data-key]').forEach((g) => {
+    const [kind, field] = g.dataset.key.split('.');
+    g.innerHTML = '';
+    for (const v of OPTIONS[g.dataset.key]) {
+      const b = document.createElement('button');
+      b.setAttribute('role', 'radio');
+      b.textContent = field === 'count' ? `x${v}` : `crop ${v}`;
+      b.setAttribute('aria-checked', String(draft[kind][field] === v));
+      b.onclick = () => { draft[kind][field] = v; renderSettings(); };
+      g.appendChild(b);
+    }
+  });
+  document.querySelectorAll('[data-model]').forEach((b) => (b.textContent = `${draft[b.dataset.model].model} arrow_drop_down`));
+}
+$('tune').onclick = () => { draft = JSON.parse(JSON.stringify(saved)); renderSettings(); $('settings').style.display = 'block'; };
+$('back').onclick = () => ($('settings').style.display = 'none');
+$('save').onclick = () => { Object.assign(saved, JSON.parse(JSON.stringify(draft))); $('settings').style.display = 'none'; window.__savedCount = (window.__savedCount ?? 0) + 1; };
+document.querySelectorAll('[data-model]').forEach((b) => (b.onclick = () => {
+  const pane = overlay();
+  for (const m of MODELS[b.dataset.model]) {
+    const it = document.createElement('button');
+    it.setAttribute('role', 'menuitem');
+    it.textContent = m;
+    it.onclick = () => { draft[b.dataset.model].model = m.replace(/^🍌\s*/, ''); pane.remove(); renderSettings(); };
+    pane.appendChild(it);
+  }
+}));
+
+function overlay(text) {
+  const p = document.createElement('div');
+  p.className = 'cdk-overlay-pane';
+  p.style.cssText = 'left:30%;top:20%;width:360px';
+  if (text) p.innerHTML = text;
+  document.body.appendChild(p);
+  return p;
+}
+document.addEventListener('keydown', (e) => { if (e.key === 'Escape') document.querySelectorAll('.cdk-overlay-pane:not([data-sticky])').forEach((p) => p.remove()); });
+
+// What's-new dialog on first load, like Flow's changelog.
+if (params.get('changelog') !== '0') {
+  const d = overlay('<h3>Nano Banana 2.1 🍌</h3><p>Introducing Nano Banana 2.1, improving visual quality.</p><button>View all changelogs</button> <button id="gs">Get started</button>');
+  d.dataset.sticky = '1';
+  d.querySelector('#gs').onclick = () => d.remove();
+}
+
+// Ingredients picker with "Upload media" that opens a file input, like Flow.
+$('add').onclick = () => {
+  const pane = overlay('<div>All · Images · Videos · Uploads</div>');
+  const up = document.createElement('button');
+  up.innerHTML = '<span>upload</span> Upload media';
+  up.onclick = () => {
+    let input = document.querySelector('input[type=file]#picker');
+    if (!input) {
+      input = document.createElement('input');
+      input.type = 'file';
+      input.id = 'picker';
+      input.multiple = true;
+      input.accept = '.png,.jpg,.jpeg,.webp';
+      input.style.display = 'none';
+      document.body.appendChild(input);
+      input.onchange = async () => {
+        const files = [...input.files];
+        if (!consented) {
+          const c = overlay('<h3>Rights to use this image</h3><p>Make sure you have the necessary rights to any content or files that you upload.</p><button id="cx">Cancel</button><button id="ok">I agree</button>');
+          c.dataset.sticky = '1';
+          c.querySelector('#cx').onclick = () => c.remove();
+          c.querySelector('#ok').onclick = () => { consented = true; c.remove(); };
+          return;
+        }
+        await sleep(400);
+        for (const f of files) {
+          attached.push(f);
+          const img = document.createElement('img');
+          img.src = URL.createObjectURL(f);
+          $('chips').appendChild(img);
+        }
+        pane.remove();
+      };
+    }
+    input.click(); // FlowForge's MAIN-world hook catches this instead of an OS dialog
+  };
+  pane.appendChild(up);
+};
+window.__consent = () => { consented = true; };
+
+$('newSession').onclick = () => { $('log').innerHTML = ''; attached = []; $('chips').innerHTML = ''; };
+
+function msg(t, cls = '') { const d = document.createElement('div'); d.className = 'msg ' + cls; d.textContent = t; $('log').appendChild(d); return d; }
+
+async function makeImage(w, h, label) {
+  const c = document.createElement('canvas');
+  c.width = w; c.height = h;
+  const x = c.getContext('2d');
+  x.fillStyle = '#356'; x.fillRect(0, 0, w, h); x.fillStyle = '#fff'; x.font = '40px sans-serif'; x.fillText(label.slice(0, 20), 20, h / 2);
+  return URL.createObjectURL(await new Promise((r) => c.toBlob(r, 'image/png')));
+}
+
+const DIMS = { '16:9': [1024, 576], '9:16': [576, 1024], '1:1': [768, 768], '4:3': [960, 720], '3:4': [720, 960] };
+$('go').onclick = async () => {
+  const text = $('composer').innerText.trim();
+  if (!text) return;
+  $('composer').textContent = '';
+  const refs = attached.length;
+  attached = []; $('chips').innerHTML = '';
+  msg(text, 'user');
+  $('go').setAttribute('aria-label', 'Stop');
+  const m = msg('Working on it…');
+  await sleep(700);
+  const video = /\bvideo\b/i.test(text);
+  const s = saved[video ? 'video' : 'image'];
+  if ($('always').checked) {
+    m.textContent = `I'll create ${s.count} ${video ? 'video' : 'image'}(s). `;
+    const b = document.createElement('button'); b.textContent = 'Generate'; m.appendChild(b);
+    await new Promise((r) => (b.onclick = r)); b.remove();
+  }
+  const [w, h] = DIMS[s.aspect];
+  for (let i = 0; i < s.count; i++) {
+    const img = document.createElement('img');
+    img.src = await makeImage(w, h, `${s.model} ${i + 1}${refs ? ' +ref' : ''}`);
+    m.appendChild(img);
+    $('media').prepend(img.cloneNode());
+  }
+  m.firstChild.textContent = `Done (${s.model}, ${s.aspect}, x${s.count}${refs ? `, ${refs} ref` : ''}).`;
+  $('go').setAttribute('aria-label', 'Start generation');
+};
+</script>
+</body>
+</html>

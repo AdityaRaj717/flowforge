@@ -1,0 +1,8 @@
+node_modules/
+dist/
+*.log
+.env
+packages/agent/data/
+packages/extension/release/
+tools/license/private.key
+graft/

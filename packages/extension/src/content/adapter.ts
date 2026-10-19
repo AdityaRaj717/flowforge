@@ -1,0 +1,331 @@
+import type { ErrorCode, Job } from '@flowforge/core';
+import { MODE_OUTPUT } from '@flowforge/core';
+import type { SelectorPack, Strategy, TargetId } from '../shared/pack';
+import type { CollectedOutput, RefPayload, RunSettings } from '../shared/messages';
+import { b64ToBlob } from '../shared/db';
+import { clickEl, find, isEnabled, isVisible, matchStrategy, nap, NewTextRecorder, normalize, readText, setText, sleepReal, strategiesFor, waitFor } from './dom';
+import { checkSignals, detectPageState, isBusy } from './detect';
+import { candidateReady, collect, listMedia, snapshotKeys } from './media';
+import { applyAgentSettings, composerArea, dismissBenignDialogs, uploadViaPicker } from './flowui';
+
+export class JobFailure extends Error {
+  constructor(public code: ErrorCode, message: string, public submitted: boolean, public providerMessage?: string) {
+    super(message);
+  }
+}
+
+export interface RunContext {
+  job: Job;
+  settings: RunSettings;
+  refs: RefPayload[];
+  pack: SelectorPack;
+  taught: Partial<Record<TargetId, Strategy[]>>;
+  progress: (state: 'preparing' | 'submitting' | 'generating' | 'verifying', note?: string) => void;
+  cancelled: () => boolean;
+}
+
+export interface RunResult {
+  outputs: CollectedOutput[];
+  observed: Job['observed'];
+  notes: string[];
+}
+
+const PAGE_FAIL: Partial<Record<string, ErrorCode>> = {
+  captcha: 'CAPTCHA',
+  unusual_activity: 'UNUSUAL_ACTIVITY',
+  signed_out: 'SIGNED_OUT',
+  not_flow: 'FLOW_TAB_MISSING',
+  ui_unknown: 'UI_CHANGED',
+};
+
+export async function runJob(ctx: RunContext): Promise<RunResult> {
+  const { job, settings, pack, taught } = ctx;
+  const notes: string[] = [];
+  const want = MODE_OUTPUT[job.mode];
+  let submitted = false;
+  const checkCancel = () => {
+    if (ctx.cancelled()) throw new JobFailure('CANCELLED', 'Cancelled.', submitted);
+  };
+
+  // ---- preflight ----
+  ctx.progress('preparing', 'checking the Flow tab');
+  if (await dismissBenignDialogs(pack, taught)) notes.push("closed Flow's what's-new dialog");
+  if (pack.signals.consent.patterns.some((p) => new RegExp(p, 'i').test(document.body.innerText.slice(0, 40_000)))) {
+    throw new JobFailure('NEEDS_CONSENT', 'Flow is showing an agreement that only you can accept.', false);
+  }
+  const state = await waitFor(() => {
+    const s = detectPageState(pack, taught);
+    return s === 'loading' || s === 'busy' ? null : s;
+  }, 30_000, ctx.cancelled);
+  checkCancel();
+  if (!state) throw new JobFailure('TIMEOUT', 'Flow stayed busy or loading for 30s before the job could start.', false);
+  const pageFail = PAGE_FAIL[state];
+  if (pageFail) throw new JobFailure(pageFail, `Flow tab is not ready (${state.replace('_', ' ')}).`, false);
+
+  if (settings.freshSession) {
+    const ns = find('newSession', pack, taught);
+    if (ns && isEnabled(ns.el)) {
+      await clickEl(ns.el);
+      await sleepReal(900);
+    }
+  }
+
+  // ---- options ----
+  const applied = await applyOptions(ctx, notes);
+  checkCancel();
+
+  // ---- references ----
+  if (ctx.refs.length) {
+    ctx.progress('preparing', `attaching ${ctx.refs.length} reference image(s)`);
+    await attachRefs(ctx);
+    notes.push(`attached ${ctx.refs.length} reference(s)`);
+  }
+  checkCancel();
+
+  // ---- prompt ----
+  const text = composeText(job, ctx.refs, pack, settings, applied);
+  const composer = find('composer', pack, taught);
+  if (!composer) throw new JobFailure('UI_ELEMENT_MISSING', 'Prompt box not found.', false);
+  await setText(composer.el, text);
+  await nap(250);
+  if (normalize(readText(composer.el)).length < Math.min(10, normalize(text).length)) {
+    throw new JobFailure('UI_CHANGED', 'Typed the prompt but the prompt box did not keep it.', false);
+  }
+
+  // ---- submit ----
+  ctx.progress('submitting');
+  const before = snapshotKeys(pack);
+  const recorder = new NewTextRecorder();
+  const submit = await waitFor(() => {
+    const s = find('submit', pack, taught);
+    return s && isEnabled(s.el) ? s : null;
+  }, 20_000, ctx.cancelled);
+  checkCancel();
+  if (!submit) throw new JobFailure('UI_ELEMENT_MISSING', 'Generate button not found or stayed disabled (references still uploading?).', false);
+  // Approve buttons already on the page (earlier chat turns) are never clicked; only new ones.
+  const staleApprove = new Set(strategiesFor('approve', pack, taught).flatMap((s) => matchStrategy(s)));
+  recorder.start();
+  await clickEl(submit.el);
+  submitted = true;
+  ctx.progress('generating', 'submitted');
+
+  try {
+    const outputs = await waitForOutputs(ctx, before, recorder, text, () => submitted, staleApprove, submit.el);
+    ctx.progress('verifying', `${outputs.length} output(s) found`);
+    const collected: CollectedOutput[] = [];
+    for (const c of outputs) {
+      collected.push(await collect(c, settings.extractLastFrame && c.kind === 'video'));
+    }
+    const kinds = new Set(collected.map((c) => c.kind));
+    if (!kinds.has(want)) notes.push(`expected ${want} output, page produced ${[...kinds].join('/')}`);
+    return { outputs: collected, observed: { outputs: collected.length }, notes };
+  } finally {
+    recorder.stop();
+  }
+}
+
+async function waitForOutputs(ctx: RunContext, before: Set<string>, rec: NewTextRecorder, typed: string, submitted: () => boolean, staleApprove: Set<Element>, submitEl: Element) {
+  const { pack, taught, settings, job } = ctx;
+  const want = MODE_OUTPUT[job.mode];
+  const expected = job.options.outputs ?? 1;
+  const deadline = Date.now() + settings.timeoutSec * 1000;
+  let approvals = 0;
+  let stableSince = 0;
+  let lastCount = -1;
+  let sawBusy = false;
+  const startedAt = Date.now();
+
+  while (Date.now() < deadline) {
+    if (ctx.cancelled()) {
+      const stop = find('stop', pack, taught);
+      if (stop) await clickEl(stop.el);
+      throw new JobFailure('CANCELLED', 'Cancelled while generating.', submitted());
+    }
+    await nap(1000);
+
+    const sig = checkSignals(pack, rec.text(), [typed, job.prompt]);
+    if (sig) throw new JobFailure(sig.code, sig.message, true, sig.message);
+
+    if (settings.autoApprove && approvals < 4) {
+      const ap = find('approve', pack, taught);
+      const submitNow = find('submit', pack, taught)?.el;
+      const inComposer = !!ap && !!composerArea(pack, taught)?.contains(ap.el);
+      const usable = ap && !inComposer && !staleApprove.has(ap.el) && ap.el !== submitEl && ap.el !== submitNow && !ap.el.contains(submitEl);
+      if (ap && usable && isEnabled(ap.el) && Date.now() - startedAt > 1500) {
+        staleApprove.add(ap.el);
+        await clickEl(ap.el);
+        approvals++;
+        ctx.progress('generating', 'approved the agent plan');
+        stableSince = 0;
+        continue;
+      }
+    }
+
+    const busy = isBusy(pack, taught);
+    if (busy) sawBusy = true;
+    const fresh = listMedia(pack).filter((m) => !before.has(m.key));
+    const ready = fresh.filter(candidateReady);
+    const wanted = ready.filter((m) => m.kind === want);
+    const count = wanted.length || ready.length;
+    if (count !== lastCount) {
+      lastCount = count;
+      stableSince = Date.now();
+      if (count) ctx.progress('generating', `${count} output(s) so far`);
+    }
+    const settled = Date.now() - stableSince >= settings.settleSec * 1000;
+    if (!busy && count > 0 && (count >= expected || settled)) {
+      return wanted.length ? wanted : ready;
+    }
+    // Not busy, nothing new, and long enough that the agent clearly answered with text instead.
+    if (!busy && sawBusy && count === 0 && Date.now() - stableSince > Math.max(25_000, settings.settleSec * 4000)) {
+      const tail = rec.text().split('\n').filter((l) => !normalize(typed).includes(normalize(l))).slice(-3).join(' ').slice(0, 300);
+      throw new JobFailure('NO_OUTPUT', 'Flow finished without producing media.', true, tail || undefined);
+    }
+  }
+  throw new JobFailure('TIMEOUT', `No finished output after ${settings.timeoutSec}s.`, true);
+}
+
+// ---------- options ----------
+
+interface Applied {
+  aspect: boolean;
+  count: boolean;
+  model: boolean;
+}
+
+async function chooseFromMenu(menuId: TargetId, words: string[], ctx: RunContext): Promise<boolean> {
+  const menu = find(menuId, ctx.pack, ctx.taught);
+  if (!menu) return false;
+  await clickEl(menu.el);
+  await nap(400);
+  const rx = words.map((w) => new RegExp(`^\\s*${w.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}\\b`, 'i'));
+  const opt = await waitFor(() => {
+    const els = matchStrategy({ css: '[role="option"], [role="menuitem"], [role="menuitemradio"], [role="radio"], li, button' })
+      .filter((e) => isVisible(e) && e !== menu.el && rx.some((r) => r.test((e as HTMLElement).innerText ?? '')));
+    return els[0] as HTMLElement | undefined;
+  }, 2500);
+  if (!opt) {
+    document.dispatchEvent(new KeyboardEvent('keydown', { key: 'Escape', bubbles: true }));
+    return false;
+  }
+  await clickEl(opt);
+  await nap(300);
+  return true;
+}
+
+async function applyOptions(ctx: RunContext, notes: string[]): Promise<Applied> {
+  const applied: Applied = { aspect: false, count: false, model: false };
+  const { job, settings, pack } = ctx;
+  if (settings.optionStrategy === 'none' || settings.optionStrategy === 'instruction') return applied;
+  const o = job.options;
+  const kind = MODE_OUTPUT[job.mode];
+  const panel = o.aspect || o.outputs || o.model ? await applyAgentSettings(kind, { aspect: o.aspect, count: o.outputs, model: o.model }, pack, ctx.taught) : null;
+  if (panel) {
+    applied.aspect = panel.aspect;
+    applied.count = panel.count;
+    applied.model = panel.model;
+    if (panel.missing.length) notes.push(`Flow has no ${panel.missing.join(', ')} for ${kind}s`);
+    if (panel.missing.length && settings.optionStrategy === 'ui') throw new JobFailure('UNSUPPORTED_OPTION', `Flow does not offer ${panel.missing.join(', ')} for ${kind}s.`, false);
+    if (panel.changed) notes.push(`set Flow's ${kind} defaults: ${[o.aspect, o.outputs && `x${o.outputs}`, o.model].filter(Boolean).join(', ')}`);
+    return applied;
+  }
+  if (o.aspect) applied.aspect = await chooseFromMenu('aspectMenu', pack.optionText.aspect[o.aspect] ?? [o.aspect], ctx);
+  if (o.outputs) applied.count = await chooseFromMenu('countMenu', pack.optionText.count[String(o.outputs)] ?? [String(o.outputs)], ctx);
+  if (o.model) applied.model = await chooseFromMenu('modelMenu', [o.model], ctx);
+  const missing = (Object.keys(applied) as (keyof Applied)[]).filter((k) => !applied[k] && (k === 'aspect' ? o.aspect : k === 'count' ? o.outputs : o.model));
+  if (missing.length && settings.optionStrategy === 'ui') {
+    throw new JobFailure('UNSUPPORTED_OPTION', `Could not set ${missing.join(', ')} in Flow's controls.`, false);
+  }
+  if (Object.values(applied).some(Boolean)) notes.push(`set in Flow UI: ${Object.entries(applied).filter(([, v]) => v).map(([k]) => k).join(', ')}`);
+  return applied;
+}
+
+// ---------- prompt text ----------
+
+const REF_PHRASE: Record<string, string> = {
+  start: 'as the first frame',
+  end: 'as the last frame',
+  ingredient: 'as an ingredient/reference',
+  character: 'as the character reference',
+  style: 'as the style reference',
+  source: 'as the image to edit',
+};
+
+export function composeText(job: Job, refs: RefPayload[], pack: SelectorPack, settings: RunSettings, applied: Applied): string {
+  const prompt = job.options.negativePrompt ? `${job.prompt}\n\nAvoid: ${job.options.negativePrompt}` : job.prompt;
+  if (settings.optionStrategy === 'none' || settings.optionStrategy === 'ui') return prompt;
+  const o = job.options;
+  const kind = MODE_OUTPUT[job.mode] === 'image' ? 'image' : 'video';
+  const count = o.outputs ?? 1;
+  const needs = (!applied.aspect && o.aspect) || (!applied.count && o.outputs && o.outputs > 1) || (!applied.model && o.model) || o.durationSec || refs.length;
+  if (!needs && settings.optionStrategy === 'auto') return prompt;
+  let text = pack.instruction.template
+    .replace('{count}', applied.count ? 'the' : String(count))
+    .replace('{kind}', `${kind}${count > 1 && !applied.count ? 's' : ''}`)
+    .replace('{aspectPhrase}', !applied.aspect && o.aspect ? `in ${o.aspect} aspect ratio` : '')
+    .replace('{modelPhrase}', !applied.model && o.model ? ` with ${o.model}` : '')
+    .replace('{durationPhrase}', o.durationSec && kind === 'video' ? `, ${o.durationSec} seconds long` : '')
+    .replace('{prompt}', prompt);
+  if (refs.length) {
+    const lines = refs.map((r, i) => `attached image ${i + 1} ${REF_PHRASE[r.role] ?? ''}`.trim());
+    text = text.replace(/\. Use this prompt exactly:/, `. Use ${lines.join('; ')}. Use this prompt exactly:`);
+  }
+  return text.replace(/ {2,}/g, ' ').replace(/ \./g, '.');
+}
+
+// ---------- references ----------
+
+async function attachRefs(ctx: RunContext): Promise<void> {
+  const { pack, taught } = ctx;
+  const files = ctx.refs.map((r, i) => new File([b64ToBlob(r.dataB64, r.mime)], r.name || `ref_${i + 1}.png`, { type: r.mime }));
+  let input = find('fileInput', pack, taught, { visible: false });
+  const area = composerArea(pack, taught);
+  const chipsBefore = area?.querySelectorAll('img').length ?? 0;
+  if (!input) {
+    const r = await uploadViaPicker(files, pack, taught, ctx.cancelled);
+    if (r === 'consent') throw new JobFailure('NEEDS_CONSENT', 'Flow asked you to confirm you have the rights to the uploaded images.', false);
+    if (r === 'ok') {
+      // Uploaded through Flow's own picker; wait for the attachment chips in the prompt box.
+      const ok = await waitFor(() => (composerArea(pack, taught)?.querySelectorAll('img').length ?? 0) >= chipsBefore + 1, 30_000, ctx.cancelled);
+      document.dispatchEvent(new KeyboardEvent('keydown', { key: 'Escape', bubbles: true }));
+      if (!ok) throw new JobFailure('UI_ELEMENT_MISSING', 'Uploaded the references, but they did not show up in the prompt box. Teach the "Add image" control or attach them by hand.', false);
+      await sleepReal(1200);
+      return;
+    }
+    input = find('fileInput', pack, taught, { visible: false });
+  }
+  const before = document.querySelectorAll('img').length;
+  if (input && input.el instanceof HTMLInputElement) {
+    const dt = new DataTransfer();
+    const multi = input.el.multiple;
+    for (const f of multi ? files : files.slice(0, 1)) dt.items.add(f);
+    input.el.files = dt.files;
+    input.el.dispatchEvent(new Event('input', { bubbles: true }));
+    input.el.dispatchEvent(new Event('change', { bubbles: true }));
+    // Inputs that take one file at a time get the rest one by one.
+    if (!multi) {
+      for (const f of files.slice(1)) {
+        await nap(1200);
+        const again = find('fileInput', pack, taught, { visible: false });
+        if (!(again?.el instanceof HTMLInputElement)) break;
+        const d2 = new DataTransfer();
+        d2.items.add(f);
+        again.el.files = d2.files;
+        again.el.dispatchEvent(new Event('change', { bubbles: true }));
+      }
+    }
+  } else {
+    // Last resort: drop the files on the prompt box, as a person dragging them in would.
+    const composer = find('composer', pack, taught);
+    if (!composer) throw new JobFailure('UI_ELEMENT_MISSING', 'No way to attach references (no file input, attach button or prompt box).', false);
+    const dt = new DataTransfer();
+    files.forEach((f) => dt.items.add(f));
+    for (const type of ['dragenter', 'dragover', 'drop']) {
+      composer.el.dispatchEvent(new DragEvent(type, { bubbles: true, cancelable: true, dataTransfer: dt }));
+    }
+  }
+  // Wait until previews show up (new images on the page), so submit doesn't race the upload.
+  const ok = await waitFor(() => document.querySelectorAll('img').length >= before + Math.min(1, files.length), 15_000, ctx.cancelled);
+  if (!ok) throw new JobFailure('UI_ELEMENT_MISSING', 'Reference images did not appear in Flow after attaching.', false);
+  await sleepReal(1200);
+}

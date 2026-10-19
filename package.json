@@ -1,0 +1,24 @@
+{
+  "name": "flowforge",
+  "private": true,
+  "version": "0.1.0",
+  "description": "Queue, workflow and asset workspace for Google Flow (independent third-party tool).",
+  "workspaces": [
+    "packages/core",
+    "packages/extension",
+    "packages/agent",
+    "packages/license-server"
+  ],
+  "scripts": {
+    "build": "npm run build -w @flowforge/core && npm run build -w @flowforge/extension && npm run build -w @flowforge/agent",
+    "test": "npm test -w @flowforge/core && npm test -w @flowforge/extension && npm test -w @flowforge/agent && npm test -w @flowforge/license-server",
+    "typecheck": "npm run typecheck --workspaces --if-present",
+    "build:dev": "npm run build:dev -w @flowforge/extension && npm run build -w @flowforge/agent",
+    "e2e": "npm run build:dev && node packages/extension/test/e2e.mjs",
+    "package": "npm run build && node tools/package.mjs",
+    "license": "node tools/license.mjs"
+  },
+  "engines": {
+    "node": ">=20"
+  }
+}
