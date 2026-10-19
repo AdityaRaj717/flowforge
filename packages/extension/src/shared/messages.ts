@@ -82,6 +82,8 @@ export interface UiMapReport {
 
 export type PanelRequest =
   | { t: 'getState' }
+  /** From the content script: media on Flow's CDN is cross-origin there, but not for the extension. */
+  | { t: 'fetchMedia'; url: string }
   | { t: 'createQueue'; name: string; mode?: string }
   | { t: 'updateQueue'; queueId: string; patch: Record<string, unknown> }
   | { t: 'deleteQueue'; queueId: string }

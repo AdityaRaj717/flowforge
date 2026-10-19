@@ -165,7 +165,28 @@ export async function uploadViaPicker(files: File[], pack: SelectorPack, taught:
   input.dispatchEvent(new Event('change', { bubbles: true }));
   // Flow may ask the person to confirm upload rights; that is theirs to accept.
   const consent = await waitFor(() => pack.signals.consent.patterns.some((p) => rx(p).test(document.body.innerText.slice(0, 40_000))), 2500, cancelled);
-  return consent ? 'consent' : 'ok';
+  if (consent) return 'consent';
+  // Live Flow (2026-10-19): an upload lands in the picker's "Recent" list; it still has to be selected
+  // and added with "Add to prompt" before it shows as a chip in the prompt box.
+  const addBtn = () => [...document.querySelectorAll<HTMLElement>('.detail-add-to-prompt-btn, button')].find((b) => isVisible(b) && /^\s*add to prompt\s*$/i.test(b.innerText));
+  if (!(await waitFor(addBtn, 3000, cancelled))) return 'ok'; // older UI: the upload attaches directly
+  for (const f of files) {
+    const item = await waitFor(
+      () => [...document.querySelectorAll<HTMLElement>('[role="option"].asset-item, [role="option"]')].find((e) => isVisible(e) && e.innerText.trim().split('\n')[0] === f.name),
+      30_000,
+      cancelled,
+    );
+    if (!item) break;
+    await clickEl(item);
+    const add = await waitFor(addBtn, 3000, cancelled);
+    if (add) await clickEl(add);
+    await sleepReal(800);
+    if (f !== files[files.length - 1]) {
+      await clickEl(attach.el);
+      await sleepReal(800);
+    }
+  }
+  return 'ok';
 }
 
 /** The element that holds the prompt box and its buttons (used to spot attachment chips). */

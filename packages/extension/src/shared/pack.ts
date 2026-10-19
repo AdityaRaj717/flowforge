@@ -51,6 +51,8 @@ export interface SelectorPack {
     excludeWithin: string[]; // css of containers whose media are not outputs (composer chips, avatars)
     /** Hosts whose images are never outputs (icons, zero-state art). */
     denyHosts: string[];
+    /** Optional: a newest-first grid item. New outputs must sit above every tile that existed before submit. */
+    newestFirstItem?: string;
   };
   /** Flow's "Agent settings" panel (composer › Settings), where per-kind defaults live. */
   agentSettings: {
@@ -140,7 +142,12 @@ export const DEFAULT_PACK: SelectorPack = {
       optional: true,
       // Only buttons that appear after submitting and sit outside the prompt box are considered,
       // so "Generate" here is the agent's confirmation, never the composer's submit button.
-      strategies: [{ text: '^(approve|confirm|proceed|generate|continue|yes|go ahead|confirmer|valider|générer)\\b', tag: 'button' }],
+      // Live Flow (2026-10-19) shows Approve / Always approve / Reject as role="radio" rows before a
+      // credit-costing video. Exact match only: "Always approve" would change the user's Flow setting.
+      strategies: [
+        { role: 'radio', name: '^(approve|approuver)$' },
+        { text: '^(approve|confirm|proceed|generate|continue|yes|go ahead|confirmer|valider|générer)\\b', tag: 'button' },
+      ],
     },
     settings: {
       label: 'Generation settings',
@@ -168,6 +175,9 @@ export const DEFAULT_PACK: SelectorPack = {
     minImageSide: 256,
     excludeWithin: ['[contenteditable="true"]', 'header', 'nav', '[role="dialog"] [aria-label*="avatar" i]', '#flowforge-overlay', '.cdk-overlay-pane'],
     denyHosts: ['gstatic.com', 'lh3.google.com/u/', 'googleusercontent.com/a/'],
+    // Live Flow (2026-10-19): the grid is virtualised, so older tiles re-enter the DOM as new rows land
+    // and look "new"; they always enter below the tiles that were already there.
+    newestFirstItem: 'flow-grid-tile-container',
   },
   agentSettings: {
     heading: '^agent settings$',

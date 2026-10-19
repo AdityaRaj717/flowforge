@@ -164,6 +164,7 @@ function Canvas({ wf, ps, onRun }: { wf: Workflow; ps: PanelState | null; onRun:
   const persist = useCallback(() => {
     if (saveTimer.current) clearTimeout(saveTimer.current);
     saveTimer.current = setTimeout(() => {
+      saveTimer.current = undefined; // saved: nothing left for the unmount flush to write
       const { nodes: ns, edges: es, name: nm } = latest.current;
       void putLocal('workflows', fromFlow({ ...wf, name: nm }, ns, es));
     }, 500);
@@ -251,7 +252,13 @@ function Canvas({ wf, ps, onRun }: { wf: Workflow; ps: PanelState | null; onRun:
         <span className={`chip ${errors.length ? 'bad' : 'ok'}`}>{errors.length ? `${errors.length} issue(s)` : 'Ready'}</span>
         {limit !== null && limit !== undefined && <span className={`small ${nodes.length > limit ? '' : 'faint'}`} style={nodes.length > limit ? { color: 'var(--warn)' } : undefined}>{nodes.length}/{limit} nodes{nodes.length > limit ? ` (over the ${ps?.license.limits.label} limit)` : ''}</span>}
         <button className="btn sm ghost right" onClick={exportWf}>Export</button>
-        <button className="btn sm ghost danger" onClick={() => confirm(`Delete workflow "${name}"?`) && act(() => delLocal('workflows', wf.id))}>Delete</button>
+        <button className="btn sm ghost danger" onClick={() => {
+          if (!confirm(`Delete workflow "${name}"?`)) return;
+          // A pending save would otherwise be flushed on unmount and bring the workflow back.
+          clearTimeout(saveTimer.current);
+          saveTimer.current = undefined;
+          void act(() => delLocal('workflows', wf.id));
+        }}>Delete</button>
       </div>
       <div className="wf-body">
         <ReactFlow

@@ -46,6 +46,10 @@ describe('csv import', () => {
     expect(res.duplicates).toEqual([{ line: 3, duplicateOf: 2 }]);
     expect(res.rows[2].warnings[0]).toMatch(/Outputs must be 1-4/);
   });
+  it('a template filled with different vars is not a duplicate', () => {
+    const res = rowsFromTable(parseCsv('prompt,creature\nA {{creature}},dragon\nA {{creature}},phoenix\nA {{creature}},phoenix'));
+    expect(res.duplicates).toEqual([{ line: 4, duplicateOf: 3 }]);
+  });
 });
 
 describe('json import', () => {

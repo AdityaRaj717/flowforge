@@ -2,7 +2,7 @@ import type { Job, LogEvent } from '@flowforge/core';
 import { ADAPTER_VERSION, PRODUCT_VERSION, newQueue, redact } from '@flowforge/core';
 import type { FromWorker, PanelRequest, PanelResponse, UiMapReport } from '../shared/messages';
 import { PANEL_PORT, WORKER_PORT } from '../shared/messages';
-import { getAll, kvSet } from '../shared/db';
+import { blobToB64, getAll, kvSet } from '../shared/db';
 import { loadSettings, loadTaught, saveSettings, saveTaught } from '../shared/settings';
 import type { TargetId } from '../shared/pack';
 import { currentPack, license, quota, refreshPack } from './entitlement';
@@ -201,6 +201,14 @@ async function handle(msg: PanelRequest): Promise<unknown> {
       await saveTaught(msg.target ? taught : {});
       return true;
     }
+    case 'fetchMedia': {
+      const u = new URL(msg.url);
+      if (u.protocol !== 'https:' || !/(^|\.)(flow-content\.google|googleusercontent\.com|flow\.google\.com)$/.test(u.hostname)) throw new Error('Not a Flow media URL.');
+      const res = await fetch(u.href, { credentials: 'include' });
+      if (!res.ok) throw new Error(`HTTP ${res.status}`);
+      const blob = await res.blob();
+      return { b64: await blobToB64(blob), type: blob.type };
+    }
     case 'probe': {
       const w = await activeWorker();
       sendTo(w, { t: 'probe', pack: await currentPack(), taught: await loadTaught() });
@@ -229,7 +237,11 @@ async function handle(msg: PanelRequest): Promise<unknown> {
       await connectBridge(true);
       return { ...bridgeStatus };
     case 'exportDiagnostics': {
-      const logs = (await getAll<LogEvent>('logs')).sort((a, b) => a.at - b.at).slice(-2000);
+      // Log lines quote prompts ("Started #3: <prompt>"); those stay out like the jobs' prompts below.
+      const prompts = [...state.jobs.values()].map((j) => j.prompt.trim()).filter((t) => t.length > 3).sort((a, b) => b.length - a.length);
+      const scrub = (m: string) =>
+        prompts.reduce((acc, t) => acc.split(t).join('[prompt]').split(t.slice(0, 80)).join('[prompt]'), m).replace(/^(Started #\d+): .*/, '$1: [prompt]');
+      const logs = (await getAll<LogEvent>('logs')).sort((a, b) => a.at - b.at).slice(-2000).map((l) => ({ ...l, message: scrub(l.message) }));
       const jobs = [...state.jobs.values()].map((j) => ({
         id: j.id, queue: j.queueId, index: j.index, mode: j.mode, state: j.state, attempts: j.attempts, error: j.error,
         options: { ...j.options, references: j.options.references?.map((r) => r.role) }, history: j.history.slice(-15),

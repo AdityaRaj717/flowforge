@@ -73,7 +73,9 @@ export function teach(label: string): Promise<{ strategy: Strategy | null; previ
       t.addEventListener('mouseleave', () => (t.style.outline = ''), { once: true });
     };
     const done = (r: { strategy: Strategy | null; preview?: string }) => {
-      document.removeEventListener('click', onClick, true);
+      document.removeEventListener('mousedown', onClick, true);
+      // Swallow the click that follows the captured mousedown so Flow doesn't act on it.
+      setTimeout(() => document.removeEventListener('click', swallow, true), 400);
       document.removeEventListener('keydown', onKey, true);
       document.removeEventListener('mouseover', hover, true);
       showBadge(null);
@@ -92,7 +94,13 @@ export function teach(label: string): Promise<{ strategy: Strategy | null; previ
       const strategy = uniqueAttrStrategy(el) ?? { css: cssPath(el) };
       done({ strategy, preview: `${el.tagName.toLowerCase()} ${el.getAttribute('aria-label') ?? (el as HTMLElement).innerText?.slice(0, 40) ?? ''}`.trim() });
     };
-    document.addEventListener('click', onClick, true);
+    // Captured on mousedown: Flow's prompt box (ProseMirror) never receives a `click` event.
+    const swallow = (e: MouseEvent) => {
+      e.preventDefault();
+      e.stopPropagation();
+    };
+    document.addEventListener('mousedown', onClick, true);
+    document.addEventListener('click', swallow, true);
     document.addEventListener('keydown', onKey, true);
     document.addEventListener('mouseover', hover, true);
   });

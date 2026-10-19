@@ -85,7 +85,7 @@ export function jobsFromRows(queue: Queue, rows: (RowDraft & { references?: Refe
 
 export function storyboardPrompt(sb: Storyboard, scene: Storyboard['scenes'][number], sheets: CharacterSheet[]): string {
   const parts = [
-    scene.shot && `${scene.shot} shot`,
+    scene.shot && `${scene.shot} shot.`,
     scene.action,
     scene.location && `Location: ${scene.location}.`,
     scene.camera && `Camera: ${scene.camera}.`,

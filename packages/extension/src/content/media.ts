@@ -2,7 +2,7 @@ import { sha256Hex, sniffMime } from '@flowforge/core';
 import type { SelectorPack } from '../shared/pack';
 import type { CollectedOutput } from '../shared/messages';
 import { inOverlay, isVisible } from './dom';
-import { blobToB64 } from '../shared/db';
+import { b64ToBlob, blobToB64 } from '../shared/db';
 
 export interface MediaCandidate {
   key: string;
@@ -22,6 +22,31 @@ function excluded(el: Element, pack: SelectorPack): boolean {
   });
 }
 
+// Flow serves a generation as flow-content.google/image/<id> (thumbnail) and /video/<id>, each with its
+// own signature. Keying by that id makes a tile the same item however it is currently rendered.
+function mediaKey(src: string): string {
+  const id = /flow-content\.google\/(?:image|video)\/([0-9a-f-]{36})/i.exec(src)?.[1];
+  return id ? `flow:${id}` : src;
+}
+
+/** Live Flow shows a finished video only as a thumbnail <img>; the <video> mounts on hover. */
+function videoThumbs(): HTMLImageElement[] {
+  return [...document.querySelectorAll<HTMLImageElement>('img[alt*="video thumbnail" i]')];
+}
+
+/** Hovers new video thumbnails so Flow mounts their <video> (the only place the signed video URL appears). */
+export function revealVideoThumbs(skip: Set<string>): void {
+  const mounted = new Set([...document.querySelectorAll('video')].map((v) => mediaKey(videoSrc(v))));
+  for (const img of videoThumbs()) {
+    const key = mediaKey(img.currentSrc || img.src);
+    if (skip.has(key) || mounted.has(key)) continue;
+    for (const el of [img, img.parentElement]) {
+      if (!el) continue;
+      for (const type of ['pointerover', 'pointerenter', 'mouseover', 'mouseenter']) el.dispatchEvent(new MouseEvent(type, { bubbles: type.endsWith('over') }));
+    }
+  }
+}
+
 function videoSrc(v: HTMLVideoElement): string {
   return v.currentSrc || v.src || v.querySelector('source')?.getAttribute('src') || '';
 }
@@ -32,14 +57,18 @@ export function listMedia(pack: SelectorPack): MediaCandidate[] {
   const seen = new Set<string>();
   document.querySelectorAll('video').forEach((v) => {
     const src = videoSrc(v);
-    if (!src || excluded(v, pack) || seen.has(src)) return;
-    seen.add(src);
-    out.push({ key: src, el: v, kind: 'video', src });
+    const key = mediaKey(src);
+    if (!src || excluded(v, pack) || seen.has(key)) return;
+    seen.add(key);
+    out.push({ key, el: v, kind: 'video', src });
     if (v.poster) seen.add(v.poster);
   });
   document.querySelectorAll('img').forEach((img) => {
     const src = img.currentSrc || img.src;
-    if (!src || seen.has(src) || excluded(img, pack)) return;
+    // Grid tiles carry a stable data-media-id; their src (flow.google.com/asb/...) rotates on re-render.
+    const key = img.dataset.mediaId ? `flow:${img.dataset.mediaId}` : mediaKey(src);
+    if (!src || seen.has(key) || seen.has(src) || excluded(img, pack)) return;
+    if (/video thumbnail/i.test(img.alt)) return; // stands for a video, never an image output
     // Hidden tabs never decode images, so `complete` stays false; known dimensions are enough.
     if (Math.min(img.naturalWidth, img.naturalHeight) < pack.media.minImageSide) return;
     // Known output hosts are preferred, but any large https image that is not an icon counts,
@@ -51,14 +80,18 @@ export function listMedia(pack: SelectorPack): MediaCandidate[] {
       const cs = getComputedStyle(img);
       if (cs.display === 'none' || cs.visibility === 'hidden') return;
     }
+    // Both: the chat reply shows the same image (same src) as the grid tile (keyed by media id).
+    seen.add(key);
     seen.add(src);
-    out.push({ key: src, el: img, kind: 'image', src });
+    out.push({ key, el: img, kind: 'image', src });
   });
   return out;
 }
 
 export function snapshotKeys(pack: SelectorPack): Set<string> {
-  return new Set(listMedia(pack).map((m) => m.key));
+  const keys = new Set(listMedia(pack).map((m) => m.key));
+  for (const img of videoThumbs()) keys.add(img.dataset.mediaId ? `flow:${img.dataset.mediaId}` : mediaKey(img.currentSrc || img.src));
+  return keys;
 }
 
 /** A video tile is usable once it has metadata; before that Flow is still rendering it. */
@@ -69,6 +102,11 @@ export function candidateReady(c: MediaCandidate): boolean {
   }
   const v = c.el as HTMLVideoElement;
   return v.readyState >= 1 && Number.isFinite(v.duration) && v.duration > 0;
+}
+
+/** Flow's image URLs carry a display size (`=s512-rw`); `=s0` asks for the original resolution. */
+export function fullSize(src: string): string {
+  return /\/asb\/|googleusercontent\.com/.test(src) ? src.replace(/=s\d+(-[a-z0-9-]+)?$/i, '=s0') : src;
 }
 
 async function fetchBlob(url: string): Promise<Blob | null> {
@@ -149,8 +187,15 @@ export async function probeVideo(blob: Blob, wantLastFrame: boolean): Promise<{ 
 export async function collect(c: MediaCandidate, wantLastFrame: boolean): Promise<CollectedOutput> {
   const out: CollectedOutput = { kind: c.kind };
   const isHttp = /^https?:/.test(c.src);
-  if (isHttp) out.url = c.src;
-  const blob = await fetchBlob(c.src);
+  // The download uses this URL too, so it must be the original size, not Flow's display size.
+  if (isHttp) out.url = fullSize(c.src);
+  let blob = await fetchBlob(fullSize(c.src));
+  // Flow's video CDN (flow-content.google) is cross-origin for the page; the extension can fetch it.
+  // Only when a last frame is needed, since the download step fetches the file again anyway.
+  if (!blob && wantLastFrame && isHttp) {
+    const r = await chrome.runtime.sendMessage({ t: 'fetchMedia', url: c.src }).catch(() => null);
+    if (r?.ok) blob = b64ToBlob(r.data.b64, r.data.type);
+  }
   if (blob) {
     const head = new Uint8Array(await blob.slice(0, 16).arrayBuffer());
     out.mime = sniffMime(head) ?? (blob.type || undefined);

@@ -397,11 +397,13 @@ export function rowsFromJson(text: string): ImportResult {
 
 // ---------- duplicates ----------
 
-export function findDuplicates(rows: { prompt: string; line: number; options?: JobOptions; mode?: GenerationMode }[]) {
+export function findDuplicates(rows: { prompt: string; line: number; options?: JobOptions; mode?: GenerationMode; vars?: Record<string, string> }[]) {
   const seen = new Map<string, number>();
   const dups: { line: number; duplicateOf: number }[] = [];
   for (const r of rows) {
-    const key = fnv1a(`${normalizePrompt(r.prompt)}|${r.mode ?? ''}|${r.options?.aspect ?? ''}|${r.options?.model ?? ''}`);
+    // Row variables count: one {{creature}} template filled with different values is not a duplicate.
+    const vars = r.vars ? JSON.stringify(Object.entries(r.vars).sort()) : '';
+    const key = fnv1a(`${normalizePrompt(r.prompt)}|${r.mode ?? ''}|${r.options?.aspect ?? ''}|${r.options?.model ?? ''}|${vars}`);
     const prev = seen.get(key);
     if (prev !== undefined) dups.push({ line: r.line, duplicateOf: prev });
     else seen.set(key, r.line);

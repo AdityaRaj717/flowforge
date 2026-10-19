@@ -5,7 +5,7 @@ import type { CollectedOutput, RefPayload, RunSettings } from '../shared/message
 import { b64ToBlob } from '../shared/db';
 import { clickEl, find, trustedClick, isEnabled, isVisible, matchStrategy, nap, NewTextRecorder, normalize, readText, setText, sleepReal, strategiesFor, waitFor } from './dom';
 import { checkSignals, detectPageState, isBusy } from './detect';
-import { candidateReady, collect, listMedia, snapshotKeys } from './media';
+import { candidateReady, collect, listMedia, revealVideoThumbs, snapshotKeys } from './media';
 import { applyAgentSettings, composerArea, dismissBenignDialogs, uploadViaPicker } from './flowui';
 
 export class JobFailure extends Error {
@@ -153,13 +153,15 @@ async function waitForOutputs(ctx: RunContext, before: Set<string>, rec: NewText
     if (sig) throw new JobFailure(sig.code, sig.message, true, sig.message);
 
     if (settings.autoApprove && approvals < 4) {
-      const ap = find('approve', pack, taught);
       const submitNow = find('submit', pack, taught)?.el;
-      const inComposer = !!ap && !!composerArea(pack, taught)?.contains(ap.el);
-      const usable = ap && !inComposer && !staleApprove.has(ap.el) && ap.el !== submitEl && ap.el !== submitNow && !ap.el.contains(submitEl);
-      if (ap && usable && isEnabled(ap.el) && Date.now() - startedAt > 1500) {
-        staleApprove.add(ap.el);
-        await trustedClick(ap.el);
+      const composer = composerArea(pack, taught);
+      // Every match, not just the first: an older, unanswered approval earlier in the chat must not hide this one.
+      const ap = strategiesFor('approve', pack, taught)
+        .flatMap((s) => matchStrategy(s))
+        .find((el) => isVisible(el) && !composer?.contains(el) && !staleApprove.has(el) && el !== submitEl && el !== submitNow && !el.contains(submitEl));
+      if (ap && isEnabled(ap) && Date.now() - startedAt > 1500) {
+        staleApprove.add(ap);
+        await trustedClick(ap as HTMLElement);
         approvals++;
         ctx.progress('generating', 'approved the agent plan');
         stableSince = 0;
@@ -172,10 +174,23 @@ async function waitForOutputs(ctx: RunContext, before: Set<string>, rec: NewText
       sawBusy = true;
       idleSince = 0;
     } else if (!idleSince) idleSince = Date.now();
-    const fresh = listMedia(pack).filter((m) => !before.has(m.key));
+    if (want === 'video') revealVideoThumbs(before);
+    const all = listMedia(pack);
+    let fresh = all.filter((m) => !before.has(m.key));
+    const item = pack.media.newestFirstItem;
+    if (item) {
+      // The first grid tile that existed before submit; anything new is above it, re-rendered old tiles below.
+      const anchor = all.find((m) => before.has(m.key) && m.el.closest(item))?.el.closest(item);
+      fresh = fresh.filter((m) => {
+        const tile = m.el.closest(item);
+        if (!tile) return !all.some((o) => o !== m && o.src === m.src); // chat copy of a grid tile
+        return !anchor || !!(anchor.compareDocumentPosition(tile) & Node.DOCUMENT_POSITION_PRECEDING);
+      });
+    }
     const ready = fresh.filter(candidateReady);
     const wanted = ready.filter((m) => m.kind === want);
-    const count = wanted.length || ready.length;
+    // A video job only finishes on a video: Flow re-renders older image tiles as new ones land.
+    const count = want === 'video' ? wanted.length : wanted.length || ready.length;
     if (count !== lastCount) {
       lastCount = count;
       stableSince = Date.now();
@@ -190,7 +205,10 @@ async function waitForOutputs(ctx: RunContext, before: Set<string>, rec: NewText
     // Not busy, nothing new, and long enough that the agent clearly answered with text instead.
     // Measured from when Flow went idle: tiles render a moment after the Stop button disappears,
     // so timing from the last count change would fail every generation longer than the window.
-    if (!busy && sawBusy && count === 0 && Date.now() - idleSince > Math.max(25_000, settings.settleSec * 4000)) {
+    // Flow can accept a video and park it ("scheduled ... waiting in the queue due to high demand"):
+    // keep waiting until the timeout instead of resubmitting, which would charge credits twice.
+    const parked = /scheduled|waiting in the queue|high demand|check back/i.test(rec.text());
+    if (!busy && sawBusy && !parked && count === 0 && Date.now() - idleSince > Math.max(25_000, settings.settleSec * 4000)) {
       const tail = rec.text().split('\n').filter((l) => !normalize(typed).includes(normalize(l))).slice(-3).join(' ').slice(0, 300);
       throw new JobFailure('NO_OUTPUT', 'Flow finished without producing media.', true, tail || undefined);
     }

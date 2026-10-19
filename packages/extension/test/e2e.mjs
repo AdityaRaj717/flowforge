@@ -154,6 +154,43 @@ try {
   await flow.reload();
   await panel.waitForTimeout(2500);
 
+  // Unusual activity must pause at once and never resubmit (retrying is what gets accounts flagged).
+  // Rate limits back off and retry instead.
+  const queueStatus = () => panel.evaluate((id) => new Promise((res) => {
+    const r = indexedDB.open('flowforge');
+    r.onsuccess = () => {
+      const g = r.result.transaction('queues').objectStore('queues').get(id);
+      g.onsuccess = () => res(g.result);
+    };
+  }), q.id);
+  // Start re-queues paused jobs; clear the captcha ones so they don't pause the queue again.
+  js = await jobs();
+  await send({ t: 'deleteJobs', jobIds: js.filter((x) => /captcha/.test(x.prompt)).map((x) => x.id) });
+  for (const [word, want] of [['unusual', 'UNUSUAL_ACTIVITY'], ['ratelimit', 'RATE_LIMIT']]) {
+    await panel.fill('textarea', `${word} check prompt`);
+    await panel.click('text=Add to queue');
+    await panel.waitForTimeout(500);
+    await send({ t: 'control', queueId: q.id, action: 'start' });
+    let j;
+    for (let i = 0; i < 40; i++) {
+      await panel.waitForTimeout(1000);
+      js = await jobs();
+      j = by(`${word} check prompt`);
+      if (j && ['waiting_for_user', 'retry_wait', 'failed'].includes(j.state)) break;
+    }
+    const qs = await queueStatus();
+    const submits = (j?.hist ?? []).filter((h) => h.includes('>submitting')).length;
+    if (want === 'UNUSUAL_ACTIVITY') {
+      check('unusual activity pauses the queue and is not retried', j?.state === 'waiting_for_user' && j.err === want && qs.status === 'paused' && submits === 1, `${j?.state} ${j?.err} queue=${qs.status} submits=${submits}`);
+    } else {
+      check('rate limit waits and retries instead of pausing', j?.state === 'retry_wait' && j.err === want && qs.status !== 'paused', `${j?.state} ${j?.err} queue=${qs.status}`);
+    }
+    await send({ t: 'control', queueId: q.id, action: 'stop' });
+    await send({ t: 'deleteJobs', jobIds: [j?.id].filter(Boolean) }).catch(() => undefined);
+    await flow.reload();
+    await panel.waitForTimeout(2500);
+  }
+
   // Storyboard: two video scenes, the second continues from the first one's last frame.
   const sbId = await panel.evaluate(() => new Promise((res) => {
     const r = indexedDB.open('flowforge');

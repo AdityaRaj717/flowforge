@@ -1,4 +1,4 @@
-import { lazy, Suspense, useEffect, useState } from 'react';
+import { lazy, Suspense, useEffect, useRef, useState } from 'react';
 import { call, usePanelState, useQueues } from './api';
 import { useAction } from './components/ui';
 import { QueueView } from './views/QueueView';
@@ -56,9 +56,12 @@ export function App() {
     }
   };
 
+  // Only fall back when the selected queue was deleted: a just-created queue isn't in the list yet.
+  const seenQueues = useRef(new Set<string>());
   useEffect(() => {
     if (!queueId && queues.length) setQueueId(queues[0].id);
-    if (queueId && !queues.some((q) => q.id === queueId)) setQueueId(queues[0]?.id);
+    if (queueId && seenQueues.current.has(queueId) && !queues.some((q) => q.id === queueId)) setQueueId(queues[0]?.id);
+    seenQueues.current = new Set(queues.map((q) => q.id));
   }, [queues, queueId]);
 
   const workers = ps?.engine.workers ?? [];

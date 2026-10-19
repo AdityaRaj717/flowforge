@@ -67,7 +67,7 @@ export function QueueView({ ps, queues, queueId, setQueueId, goImport }: Props) 
   }, [jobs, q]);
 
   const shown = useMemo(() => {
-    const s = search.trim().toLowerCase();
+    const s = search.trim().toLowerCase().replace(/^#(?=\d+$)/, '');
     return jobs.filter((j) => {
       if (filter === 'active' && !(ACTIVE_STATES.includes(j.state) || j.state === 'queued' || j.state === 'retry_wait' || j.state === 'blocked')) return false;
       if (filter === 'problems' && !PROBLEM.includes(j.state)) return false;
